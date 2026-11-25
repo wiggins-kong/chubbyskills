@@ -83,3 +83,12 @@ MacBook Pro M3 Pro（18GB）纯 CPU，torch 2.14.1，5 分钟中文双人播客�
 - **诊断**：用桌面 Chrome UA + 登录 cookie 拉 `https://x.com/home`，HTML 引用 `https://abs.twimg.com/responsive-web/client-web/main.<hash>.js`；在该 bundle 中匹配 `queryId:"...",operationName:"TweetResultByRestId"` 挖到当前有效 queryId `LbQZrAWyKPvExi8di3-EoA`。另发现该操作要求 `fieldToggles`（`withArticlePlainText` / `withArticleRichContentState` 置 true）才会返回 `plain_text` / `content_state`，否则 article 结果只有标题和预览；且 `TweetResultByRestId` 必须以**推文 id** 为参数（旧代码误传 syndication 返回的 article rest_id，同样拿不到全文）。
 - **修复**：queryId 获取改为「新鲜缓存（`~/.cache/x-ingest/tweet-result-query-ids.json`，TTL 24h）→ 实时从 x.com 前端 JS bundle 提取并写缓存 → 过期缓存 → 内置兜底列表」；GraphQL 请求补齐新版 features 全集与 `fieldToggles`；正文抓取改用推文 id。
 - **验证**（macOS，登录 cookie 有效）：`python3 x-ingest/scripts/fetch_tweet.py "https://x.com/369Serena/status/2103705402793730449" -o /tmp/x-fixed` 抓到全文 **2859 字**（正文，标题《小红书矩阵获客指南-全网独家，让你的活动 or 课程爆满！！！》），封面图本地化，无「预览」标注；同链接不带 cookie 复跑维持预览 + stderr 告警路径，无回归。
+
+## 2026-11-25 实测：抖音抓取改走 CDP
+
+- **背景**：无 cookie 访问抖音分享页时 `_ROUTER_DATA` 只有 `isSpider` 空壳，`/video/` 和 `/note/` 都一样；`web/api/v2/aweme/iteminfo` 返回 200 空体，`aweme/v1/web/aweme/detail` 返回 403。yt-dlp 无 cookie 报 403，Windows 新版 Chromium 的 App-Bound 加密又让 `--cookies-from-browser` 读不了登录态，所以旧的「分享页 → yt-dlp」回退在这类机器上必然失败。
+- **方案**：`douyin-transcribe/scripts/douyin_cdp.py` 用独立 profile 的无头 Edge/Chrome（随机调试端口，与正在使用的浏览器并存）打开 `iesdouyin.com/share/video/<id>/`，监听前端自己发出的 `aweme/detail` 响应并取回完整 JSON；`bootstrap.py` 负责新机器上的依赖检查与补齐。
+- **验证**（Windows 11、Edge、Python 3.14.7、`websocket-client`；本机未装 yt-dlp 与 funasr）：
+  - 图文 `https://v.douyin.com/xeHW_5KeR-E/`（aweme `7709518080586596729`）：9 张图 2160×2880，作者 bbbiubiu，`desc` 完整。
+  - 视频 `https://www.douyin.com/video/7698728487519283173`：33.4 秒、1440×1080，`play_addr` 带 Referer 返回 206，mp4 约 3.2 MiB，抽出 0.5 MB 音频。
+- **未覆盖**：视频转录端到端（本机没有 funasr，只验证到音频抽取）；macOS / Linux 的浏览器启动；评论、作者主页、私密内容（需要真实 profile 的登录态）。

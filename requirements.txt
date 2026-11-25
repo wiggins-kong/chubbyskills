@@ -7,6 +7,7 @@ transformers>=4.40   # 见 setup.sh：否则解析到 2021 年的 transformers�
 modelscope>=1.10.0
 torch>=2.0.0
 torchaudio>=2.0.0
+websocket-client>=1.7   # 抖音抓取的 CDP 客户端（douyin-transcribe/scripts/douyin_cdp.py）
 
 # 播客转录 (podcast-transcribe)
 # ------------------------------

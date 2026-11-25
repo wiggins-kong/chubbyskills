@@ -41,6 +41,8 @@ bash setup.sh doctor                  # 查看当前环境
 
 公众号、抖音和在线播客使用 `curl`；安装器只在所选能力需要时检查它。`setup.sh` 不会把技能注册到 Agent，独立目录安装仍由 `tools/install_skill.py` 完成。
 
+抖音抓取走本机无头 Chromium 的 CDP（不读 cookie，也不关你的浏览器），需要 `websocket-client`（`bash setup.sh video` 会安装）和 Edge/Chrome/Chromium 109+；新机器先跑 `douyin-transcribe/scripts/bootstrap.py` 自检，浏览器不在默认路径时用 `BROWSER_BIN` 指定。
+
 知识库的 MCP 服务另需官方 MCP SDK：
 
 ```bash

@@ -351,6 +351,8 @@ def infer_content_type(skill, source):
     lower = source.lower()
     if skill == "podcast" or lower.endswith((".mp3", ".m4a", ".wav", ".ogg", ".aac")):
         return "audio"
+    if skill == "douyin" and ("/note/" in lower or "/slides/" in lower):
+        return "note"
     if skill in {"bilibili", "douyin", "tiktok", "weibo", "youtube", "zhihu"}:
         return "video"
     if skill == "wechat" or lower.endswith(".pdf"):

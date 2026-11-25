@@ -1,6 +1,6 @@
 # Platform Status
 
-Generated at: `2026-10-08T17:24:04+08:00`
+Generated at: `2026-11-25T23:56:29+08:00`
 
 This page is generated from `platforms/*.yaml` and `templates/sites/*.yaml`.
 Default checks validate repository structure and template coverage. Run with `--local` to include local dependency readiness.
@@ -12,7 +12,7 @@ Local dependency check: `off`
 | platform | skill | status | content | failure modes | fallback | template | notes |
 |---|---|---|---|---|---|---|---|
 | Bilibili | bilibili-transcribe | stable | video, subtitle | missing_yt_dlp, no_subtitle, ffmpeg_or_funasr_missing, region_or_login_limit | subtitle-first then audio transcription | yes | Subtitle-first path keeps the default install light. |
-| Douyin | douyin-transcribe | heavy deps | video | expired_short_link, anti_bot, ffmpeg_or_funasr_missing, download_blocked, spider_shell_requires_cookies | audio transcription | yes | Platform risk is mainly link expiry and anti-bot behavior. Cookie-less share pages now return a spider shell; the downloader then falls back to yt-dlp with YTDLP_COOKIES_FROM_BROWSER (fresh douyin.com visit suffices, no login needed). |
+| Douyin | douyin-transcribe | heavy deps | video, note | expired_short_link, anti_bot, browser_unavailable, cdp_timeout, rate_limited, ffmpeg_or_funasr_missing, download_blocked | audio transcription | yes | Capture is CDP-only: a headless Chromium in its own profile opens the iesdouyin share page and reads the aweme/detail response the page itself requests, with no cookies and without touching the user's browser. The share page now returns only an anti-bot shell and cookie-less yt-dlp gets 403, so both old paths were removed. Image posts (non-empty images) save images + desc instead of transcribing. Run douyin-transcribe/scripts/bootstrap.py when websocket-client or a browser is missing. |
 | Podcast | podcast-transcribe | heavy deps | audio, rss, local_file | rss_unreachable, audio_download_failed, ffmpeg_missing, funasr_missing, long_audio_timeout | local audio file | yes | Long-form audio is slow but stable when local dependencies are ready. Optional synchronous cloud providers: dashscope (qwen3-asr-flash, 10MB/5min) and groq (whisper-large-v3-turbo, 25MB free tier). |
 | TikTok | tiktok-transcribe | beta | video | region_limit, anti_bot, missing_yt_dlp, ffmpeg_or_funasr_missing, download_blocked | audio transcription after yt-dlp download | yes | Region limits and anti-bot behavior may affect downloads. |
 | WeChat Official Account | wechat-article-ingest | beta | article, pdf | wechat_client_only, html_structure_changed, beautifulsoup_missing, pdf_parser_missing, content_too_short | pdf or saved HTML | yes | HTML structure changes frequently; PDF fallback keeps useful coverage. |

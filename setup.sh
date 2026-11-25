@@ -94,7 +94,7 @@ install_video() {
     require_cmd ffmpeg "macOS: brew install ffmpeg | Ubuntu: sudo apt install ffmpeg"
     install_ytdlp
     warn "即将安装 funasr / modelscope / torch / torchaudio，首次安装体积较大。"
-    pip_install funasr ${TRANSFORMERS_FLOOR} modelscope torch torchaudio
+    pip_install funasr ${TRANSFORMERS_FLOOR} modelscope torch torchaudio websocket-client
     info "视频转录依赖安装完成"
 }
 
