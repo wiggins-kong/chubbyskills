@@ -88,7 +88,7 @@ MacBook Pro M3 Pro（18GB）纯 CPU，torch 2.14.1，5 分钟中文双人播客�
 
 - **背景**：无 cookie 访问抖音分享页时 `_ROUTER_DATA` 只有 `isSpider` 空壳，`/video/` 和 `/note/` 都一样；`web/api/v2/aweme/iteminfo` 返回 200 空体，`aweme/v1/web/aweme/detail` 返回 403。yt-dlp 无 cookie 报 403，Windows 新版 Chromium 的 App-Bound 加密又让 `--cookies-from-browser` 读不了登录态，所以旧的「分享页 → yt-dlp」回退在这类机器上必然失败。
 - **方案**：`douyin-transcribe/scripts/douyin_cdp.py` 用独立 profile 的无头 Edge/Chrome（随机调试端口，与正在使用的浏览器并存）打开 `iesdouyin.com/share/video/<id>/`，监听前端自己发出的 `aweme/detail` 响应并取回完整 JSON；`bootstrap.py` 负责新机器上的依赖检查与补齐。
-- **验证**（Windows 11、Edge、Python 3.14.7、`websocket-client`；本机未装 yt-dlp 与 funasr）：
+- **验证**（Windows 11、Edge、Python 3.14、`websocket-client`；本机未装 yt-dlp 与 funasr）：
   - 图文 `https://v.douyin.com/xeHW_5KeR-E/`（aweme `7709518080586596729`）：9 张图 2160×2880，作者 bbbiubiu，`desc` 完整。
   - 视频 `https://www.douyin.com/video/7698728487519283173`：33.4 秒、1440×1080，`play_addr` 带 Referer 返回 206，mp4 约 3.2 MiB，抽出 0.5 MB 音频。
 - **未覆盖**：视频转录端到端（本机没有 funasr，只验证到音频抽取）；macOS / Linux 的浏览器启动；评论、作者主页、私密内容（需要真实 profile 的登录态）。
