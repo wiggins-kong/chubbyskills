@@ -13,10 +13,11 @@ identical to upstream:
 
 | Module | Change |
 |---|---|
-| Douyin capture | CDP only: a headless Chromium with its own profile reads `aweme/detail`, so the share page and yt-dlp are no longer retried on every run |
+| Douyin capture | CDP only: headless Chromium in an anonymous ephemeral profile reads `aweme/detail`, so the share page and yt-dlp are no longer retried on every run |
 | Douyin image posts | `/note/` and `/slides/` links work: text plus images localized into `<title>.assets/`, instead of failing as "not a video" |
-| Desktop CDP fallback | `chubby_common/cdp.py` uses desktop `Edge`/`Chrome` + `websocket-client` with per-site local profiles; if headless is gated, it pops up a headed browser window to wait for login/verification (180s timeout) |
-| 14-in-1 bundle | `install_skill.py --bundle` installs all 14 skills as a single `chubby` skill directory (one root `SKILL.md` + `references/*.md` + `tools/chubby_ingest.py`) |
+| Zhihu capture | Answers (`/answer/`) and columns (`zhuanlan.zhihu.com/p/`) extract full Markdown + localized images in `<title>.assets/`; mixed text+video posts keep full prose and the video link; pure question URLs (`/question/<qid>` without `/answer/`) exit without writing files; pure videos and `/video/` / `/zvideo/` transcribe via `yt-dlp` + `SenseVoice-Small` |
+| Desktop CDP fallback | `chubby_common/cdp.py` runs fast paths first and falls back to desktop `Edge`/`Chrome` + `websocket-client` with per-site local profiles (180s headed login/verify popup when headless fails), covering Bilibili subtitle anti-degradation, WeChat/Podcast login-free DOM gates, Zhihu, and `yt-dlp`/X cookie fallbacks |
+| 14-in-1 bundle | `install_skill.py --bundle` installs all 14 skills as a single `chubby` skill directory (one root `SKILL.md` + `tools/chubby_ingest.py` + 4 guides in `references/*.md`) |
 | New machine setup | `douyin-transcribe/scripts/bootstrap.py`: check, install, verify with a real link |
 
 ## 14-in-1 Unified `chubby` Bundle Install
@@ -24,15 +25,21 @@ identical to upstream:
 ```bash
 git clone https://github.com/wiggins-kong/chubbyskills.git
 cd chubbyskills
-python3 tools/install_skill.py --bundle --dest <your agent skills directory>
-# Optional: --bundle-name <custom-name>; --clean-legacy removes the 14 legacy dirs while preserving nested .venv / venv
+python3 tools/install_skill.py --bundle --clean-legacy --dest <your agent skills directory>
+# Omit --clean-legacy on a fresh install; --clean-legacy removes legacy individual dirs while preserving nested .venv / venv
+# Optional: --bundle-name <custom-name>
 ```
 
-This creates a single `chubby/` skill with one root `SKILL.md`: the Agent invokes `tools/chubby_ingest.py "<source>"` for capture and loads `references/*.md` on demand for enrichment, KB management, learning notes, and intelligence radar. Individual skill installs (`python3 tools/install_skill.py <skill> --dest ...`) remain unchanged and bundle `chubby_common/` for every skill that imports it.
+This creates a single `chubby/` skill with one root `SKILL.md`: `tools/chubby_ingest.py "<source>"` auto-detects URLs (plus BV IDs and local files) via `platforms/*.yaml` and routes to the matching capture script (or `tools/import_document.py`), with `--enrich` for post-capture summaries and tags. The 4 non-capture workflow guides remain in `references/` (`content-enrich.md`, `knowledge-base-management.md`, `learning-notes-automation.md`, `industry-intelligence-radar.md`) for on-demand loading. Individual skill installs (`python3 tools/install_skill.py --list` / `<skill> --dest ...` / `--all --dest ...`) remain supported and automatically bundle `chubby_common/` for every skill that imports it.
 
 ## Desktop-Only Chromium CDP Fallback
 
-`chubby_common/cdp.py` targets desktop `Edge` / `Chrome` / `Chromium` (109+) + `websocket-client` with isolated per-site local profiles (never touching your daily browser cookies). When HTTP or `yt-dlp` hits a login gate or anti-bot wall, it checks headless first and switches to a headed popup window on the same profile for up to 180s so you can complete login/verification. Set `BROWSER_BIN` if the browser is in a custom path.
+`chubby_common/cdp.py` targets desktop `Edge` / `Chrome` / `Chromium` (109+) + `websocket-client` with isolated per-site local profiles (never touching your daily browser cookies). It follows a **fast path first -> local per-site profile headless check -> 180s headed login/verification popup when needed** flow (set `BROWSER_BIN` for custom browser paths):
+
+- **WeChat / Podcast (login-free DOM gate)**: When HTTP hits anti-bot checks or JS rendering is required, CDP runs with `require_login=False` and waits only for rendered article content (`div.rich_media_content`) or audio metadata/URL—no account login needed.
+- **Douyin (anonymous ephemeral profile)**: Uses `ephemeral=True` headless Chromium to capture `aweme/detail` XHR directly without persisting cookies or popping a login window.
+- **Bilibili subtitle anti-degradation**: Unauthenticated `yt-dlp` subtitle fetches can exit 0 silently without a `.vtt` file; before degrading to audio download + SenseVoice ASR, it retries subtitle fetch once with CDP-exported cookies.
+- **Zhihu / X / `yt-dlp` platforms**: Zhihu uses headless CDP directly when a `zhihu` profile exists (or falls back from HTTP on `403`/`zse-ck`/login wall); `yt-dlp` (`bilibili`, `youtube`, `weibo`, `tiktok`) and `x-ingest` fall back to per-site CDP cookies or GraphQL XHR on auth/403/bot blocks.
 
 ## Douyin: start on a new machine
 

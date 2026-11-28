@@ -12,10 +12,11 @@
 
 | 模块 | 改动 |
 |---|---|
-| 抖音抓取 | 只走 CDP：独立 profile 的无头 Chromium 抓 `aweme/detail`，不再每次尝试分享页和 yt-dlp |
+| 抖音抓取 | 只走 CDP：匿名临时 profile 的无头 Chromium 抓 `aweme/detail`，不再每次尝试分享页和 yt-dlp |
 | 抖音图文 | 支持 `/note/`、`/slides/`：原文 + 图片本地化到 `<标题>.assets/`，不再报「不是视频」 |
-| 桌面 CDP 兜底 | `chubby_common/cdp.py` 统一用桌面端 `Edge`/`Chrome` + `websocket-client` 与每站点独立本地 profile；无头被拦时弹有头窗口等待登录/验证（180 秒超时），覆盖知乎图文与各平台 Cookie/DOM 回退 |
-| 14 合 1 技能包 | `install_skill.py --bundle` 将 14 个技能合并安装为单一 `chubby` 技能目录（仅 1 个根 `SKILL.md` + `references/*.md` + `tools/chubby_ingest.py`） |
+| 知乎采集 | 回答（`/answer/`）与专栏输出完整图文 Markdown 并本地化图片到 `<标题>.assets/`；图文混排视频时保留完整正文与视频链接；纯问题链接（`/question/<qid>` 无 `/answer/`）直接拒抓并提示；纯视频与 `/video/`、`/zvideo/` 走 `yt-dlp` + `SenseVoice-Small` |
+| 桌面 CDP 兜底 | `chubby_common/cdp.py` 优先轻量快路径，被拦时回退本机 `Edge`/`Chrome` + `websocket-client` 与每站点独立本地 profile（无头校验失败弹 180 秒有头窗口），覆盖 B 站防字幕退化、公众号/播客免登录 DOM 门禁、知乎与 `yt-dlp`/X 回退 |
+| 14 合 1 技能包 | `install_skill.py --bundle` 将 14 个技能合并安装为单一 `chubby` 技能目录（仅 1 个根 `SKILL.md` + `tools/chubby_ingest.py` + 4 份 `references/*.md` 工作流指南） |
 | 新机器部署 | `douyin-transcribe/scripts/bootstrap.py`：检查 → 补齐 → 用真实链接验真 |
 
 ## 14 合 1 统一技能包安装
@@ -23,15 +24,21 @@
 ```bash
 git clone https://github.com/wiggins-kong/chubbyskills.git
 cd chubbyskills
-python3 tools/install_skill.py --bundle --dest <你的 agent skills 目录>
-# 可选：--bundle-name <自定义名称>；--clean-legacy 移除旧 14 个独立技能目录（自动保留其中的 .venv / venv）
+python3 tools/install_skill.py --bundle --clean-legacy --dest <你的 agent skills 目录>
+# 首次全新安装可省略 --clean-legacy；--clean-legacy 清理旧独立技能目录时会自动保留其中的 .venv / venv
+# 可选：--bundle-name <自定义名称>
 ```
 
-安装后生成单个 `chubby/` 目录（只有一个 `SKILL.md` 入口），Agent 通过 `tools/chubby_ingest.py "<source>"` 自动识别平台并采集，需要摘要加工、知识库管理、学习笔记或情报雷达时再按需读取 `references/*.md`。单技能安装模式（`python3 tools/install_skill.py <skill> --dest ...`）保持兼容，并会为所有依赖 `chubby_common` 的技能自动打入 `chubby_common/`。
+安装后生成单个 `chubby/` 目录（仅保留 1 个根 `SKILL.md` 入口），`tools/chubby_ingest.py "<source>"` 会结合 `platforms/*.yaml` 自动识别链接、BV 号或本地文件并路由到对应采集脚本（或 `tools/import_document.py`），传 `--enrich` 可顺带生成摘要与标签。4 个非采集类工作流保留在 `references/`（`content-enrich.md`、`knowledge-base-management.md`、`learning-notes-automation.md`、`industry-intelligence-radar.md`），由 Agent 按需读取。单技能安装模式（`python3 tools/install_skill.py --list` / `<skill> --dest ...` / `--all --dest ...`）同样保留，并会自动为所有依赖 `chubby_common` 的技能打包 `chubby_common/`。
 
 ## 桌面端 Chromium CDP 兜底
 
-`chubby_common/cdp.py` 仅在桌面端运行，使用本机 `Edge` / `Chrome` / `Chromium`（109+）+ `websocket-client`，按站点隔离保存本地 profile（不读取你日常浏览器的 Cookie）。当 HTTP 或 `yt-dlp` 触发登录墙或风控时，会先用无头模式检查本地登录态，未通过则弹出同一 profile 的有头浏览器窗口等待完成登录/验证（默认 180 秒超时）。浏览器不在默认路径时用 `BROWSER_BIN` 指定。
+`chubby_common/cdp.py` 仅在桌面端运行，调用本机 `Edge` / `Chrome` / `Chromium`（109+）+ `websocket-client`，按站点隔离保存本地 profile（不读取你日常浏览器的 Cookie）。整体遵循**轻量快路径优先 → 本地按站点 profile 无头校验 → 必要时 180 秒有头弹窗登录/验证**；浏览器不在默认路径时用 `BROWSER_BIN` 指定：
+
+- **公众号 / 播客（免账号登录 DOM 门禁）**：轻量 HTTP 被验证/风控拦截或需 JS 渲染时回退 CDP（`require_login=False`），只等待正文 `div.rich_media_content` 或音频元数据渲染完成，无需登录账号。
+- **抖音（匿名临时 profile）**：直接使用 `ephemeral=True` 匿名临时 profile 无头抓取 `aweme/detail`，不保存 Cookie，也不弹登录窗。
+- **B 站防字幕退化**：未登录 `yt-dlp` 抓字幕常静默退出 0 却无 `.vtt`；在降级到音频下载 + SenseVoice 转录前，会先用 CDP 导出 Cookie 重试一次字幕抓取。
+- **知乎 / X / `yt-dlp` 平台**：知乎在已有本地 `zhihu` profile 时直连无头 CDP，否则 HTTP 遇 `403` / `zse-ck` / 登录墙再回退；`yt-dlp`（B 站、YouTube、微博、TikTok）与 X 在遇到登录或 403/风控时按站点导出 Cookie 或抓 GraphQL XHR。
 
 ## 抖音：新机器起步
 
