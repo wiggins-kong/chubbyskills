@@ -14,7 +14,24 @@
 |---|---|
 | 抖音抓取 | 只走 CDP：独立 profile 的无头 Chromium 抓 `aweme/detail`，不再每次尝试分享页和 yt-dlp |
 | 抖音图文 | 支持 `/note/`、`/slides/`：原文 + 图片本地化到 `<标题>.assets/`，不再报「不是视频」 |
+| 桌面 CDP 兜底 | `chubby_common/cdp.py` 统一用桌面端 `Edge`/`Chrome` + `websocket-client` 与每站点独立本地 profile；无头被拦时弹有头窗口等待登录/验证（180 秒超时），覆盖知乎图文与各平台 Cookie/DOM 回退 |
+| 14 合 1 技能包 | `install_skill.py --bundle` 将 14 个技能合并安装为单一 `chubby` 技能目录（仅 1 个根 `SKILL.md` + `references/*.md` + `tools/chubby_ingest.py`） |
 | 新机器部署 | `douyin-transcribe/scripts/bootstrap.py`：检查 → 补齐 → 用真实链接验真 |
+
+## 14 合 1 统一技能包安装
+
+```bash
+git clone https://github.com/wiggins-kong/chubbyskills.git
+cd chubbyskills
+python3 tools/install_skill.py --bundle --dest <你的 agent skills 目录>
+# 可选：--bundle-name <自定义名称>；--clean-legacy 移除旧 14 个独立技能目录（自动保留其中的 .venv / venv）
+```
+
+安装后生成单个 `chubby/` 目录（只有一个 `SKILL.md` 入口），Agent 通过 `tools/chubby_ingest.py "<source>"` 自动识别平台并采集，需要摘要加工、知识库管理、学习笔记或情报雷达时再按需读取 `references/*.md`。单技能安装模式（`python3 tools/install_skill.py <skill> --dest ...`）保持兼容，并会为所有依赖 `chubby_common` 的技能自动打入 `chubby_common/`。
+
+## 桌面端 Chromium CDP 兜底
+
+`chubby_common/cdp.py` 仅在桌面端运行，使用本机 `Edge` / `Chrome` / `Chromium`（109+）+ `websocket-client`，按站点隔离保存本地 profile（不读取你日常浏览器的 Cookie）。当 HTTP 或 `yt-dlp` 触发登录墙或风控时，会先用无头模式检查本地登录态，未通过则弹出同一 profile 的有头浏览器窗口等待完成登录/验证（默认 180 秒超时）。浏览器不在默认路径时用 `BROWSER_BIN` 指定。
 
 ## 抖音：新机器起步
 

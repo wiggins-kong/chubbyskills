@@ -66,31 +66,10 @@ def get_info(url: str, bvid: str) -> tuple:
         return bvid, ""
 
 
-def try_subtitles(url: str, tmpdir: str):
-    """尝试下载字幕。返回 (text, lang) 或 None。"""
-    print("  💬 尝试抓取字幕...", file=sys.stderr)
-    try:
-        ytdlp.run_ydl(
-            CFG,
-            [
-                "--skip-download",
-                "--write-subs",
-                "--write-auto-subs",
-                "--sub-langs",
-                SUB_LANGS,
-                "--sub-format",
-                "vtt",
-                "-o",
-                os.path.join(tmpdir, "sub.%(ext)s"),
-                url,
-            ],
-            timeout=CFG.subtitle_timeout,
-        )
-    except Exception:
-        return None
+def _extract_valid_vtt(tmpdir: str):
+    """解析 tmpdir 中的有效字幕文件，返回 (text, lang) 或 None。"""
     files = vtt.find_vtt_files(tmpdir)
     if not files:
-        print("  💬 无字幕，回退音频转录", file=sys.stderr)
         return None
     chosen = vtt.pick_subtitle(files, SUB_PRIORITY)
     text = vtt.parse_vtt(chosen)
@@ -99,6 +78,61 @@ def try_subtitles(url: str, tmpdir: str):
     lang = "zh" if re.search(r"[一-鿿]", text) else "en"
     print(f"  ✅ 命中字幕（{lang}，{len(text)} 字）", file=sys.stderr)
     return text, lang
+
+
+def try_subtitles(url: str, tmpdir: str):
+    """尝试下载字幕。返回 (text, lang) 或 None。"""
+    print("  💬 尝试抓取字幕...", file=sys.stderr)
+    sub_args = [
+        "--skip-download",
+        "--write-subs",
+        "--write-auto-subs",
+        "--sub-langs",
+        SUB_LANGS,
+        "--sub-format",
+        "vtt",
+        "-o",
+        os.path.join(tmpdir, "sub.%(ext)s"),
+        url,
+    ]
+    try:
+        ytdlp.run_ydl(CFG, sub_args, timeout=CFG.subtitle_timeout)
+    except Exception:
+        return None
+
+    result = _extract_valid_vtt(tmpdir)
+    if result is not None:
+        return result
+
+    # B 站未登录抓字幕常静默退出 0 且不产出有效 vtt；未显式提供 cookie 时用 CDP 登录态重试一次
+    if not ytdlp.has_explicit_cookies(CFG, sub_args):
+        cookies_path = ytdlp.ensure_platform_cookies_txt(CFG.id, url)
+        if cookies_path:
+            print("  🔐 未登录可能无法获取 B 站字幕，使用 CDP cookies 重试...", file=sys.stderr)
+            for stale in vtt.find_vtt_files(tmpdir):
+                try:
+                    os.unlink(stale)
+                except OSError:
+                    pass
+            try:
+                ytdlp.run_ydl(
+                    CFG,
+                    ["--cookies", cookies_path, *sub_args],
+                    timeout=CFG.subtitle_timeout,
+                )
+            except Exception:
+                return None
+            finally:
+                try:
+                    os.unlink(cookies_path)
+                except OSError:
+                    pass
+            result = _extract_valid_vtt(tmpdir)
+            if result is not None:
+                return result
+
+    print("  💬 无字幕，回退音频转录", file=sys.stderr)
+    return None
 
 
 def download_audio(url: str, output_dir: str, title: str) -> str:

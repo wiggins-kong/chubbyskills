@@ -22,6 +22,79 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 
+def _extract_page_audio(html: str, page_url: str) -> tuple[str | None, str]:
+    """Extract (audio_url, title) from episode HTML using existing metadata/media patterns."""
+    from urllib.parse import urljoin
+
+    title = "Podcast Episode"
+    title_match = re.search(r'<title>(.*?)</title>', html, re.IGNORECASE | re.DOTALL)
+    if title_match:
+        title = title_match.group(1).strip()
+        title = re.sub(r'\s*[-|—].*$', '', title) or title  # remove site suffix
+
+    patterns = (
+        r'<meta\s+(?:property|name)=["\']og:audio(?::url)?["\']\s+content=["\'](.*?)["\']',
+        r'<meta\s+content=["\'](.*?)["\']\s+(?:property|name)=["\']og:audio(?::url)?["\']',
+        r'<audio[^>]+src=["\'](.*?)["\']',
+        r'<audio\b[^>]*>(?:(?!</audio>).)*?<source[^>]+src=["\'](.*?)["\']',
+        r'["\'](?:audioUrl|mediaSrc|enclosure|url)["\']\s*:\s*["\']'
+        r'(https?://[^"\']+\.(?:mp3|m4a|wav|ogg|aac)[^"\']*)["\']',
+        r'(https?://[^\s"\'<>]+\.(?:mp3|m4a|wav|ogg|aac)(?:\?[^\s"\'<>]*)?)',
+    )
+    for pattern in patterns:
+        match = re.search(pattern, html, re.IGNORECASE | re.DOTALL)
+        if match and match.group(1).strip():
+            return urljoin(page_url, match.group(1).strip()), title
+    return None, title
+
+
+def _podcast_gate(session) -> bool:
+    """Wait until rendered DOM exposes an audio meta/element/media URL (no login required)."""
+    return bool(
+        session.eval_js(
+            "(() => {"
+            " const og = document.querySelector('meta[property=\"og:audio\"], meta[name=\"og:audio\"], meta[property=\"og:audio:url\"]');"
+            " if (og && og.content) return true;"
+            " const audio = document.querySelector('audio[src], audio source[src]');"
+            " if (audio && (audio.getAttribute('src') || '').trim()) return true;"
+            " const html = document.documentElement ? document.documentElement.innerHTML : '';"
+            " return /https?:\\/\\/[^\\s\"'<>]+\\.(?:mp3|m4a|wav|ogg|aac)(?:\\?[^\\s\"'<>]*)?/i.test(html);"
+            "})()",
+            await_promise=False,
+        )
+    )
+
+
+def _fetch_podcast_cdp(url: str) -> tuple[str | None, str]:
+    from urllib.parse import urljoin
+    from chubby_common import cdp
+
+    state = cdp.fetch_page_state(
+        url,
+        site="podcast",
+        gate=_podcast_gate,
+        require_login=False,
+        js=(
+            "(() => {"
+            " const og = document.querySelector('meta[property=\"og:audio\"], meta[name=\"og:audio\"], meta[property=\"og:audio:url\"]');"
+            " const audio = document.querySelector('audio[src], audio source[src]');"
+            " const raw = (og && og.content) || (audio && (audio.getAttribute('src') || '')) || '';"
+            " return {title: document.title || '', audio_url: raw.trim()};"
+            "})()"
+        ),
+        timeout=180,
+    )
+    html = (state or {}).get("html") or ""
+    audio_url, title = _extract_page_audio(html, url) if html else (None, "Podcast Episode")
+    js_data = (state or {}).get("js")
+    if isinstance(js_data, dict):
+        if not audio_url and js_data.get("audio_url"):
+            audio_url = urljoin(url, str(js_data["audio_url"]).strip())
+        if title == "Podcast Episode" and js_data.get("title"):
+            title = re.sub(r'\s*[-|—].*$', '', str(js_data["title"]).strip()) or title
+    return audio_url, title
+
+
 def download_audio(url: str, output_dir: str) -> tuple:
     """Download audio from podcast URL. Returns (audio_path, title).
 
@@ -34,49 +107,35 @@ def download_audio(url: str, output_dir: str) -> tuple:
     # Every media URL is independently validated, including extracted page metadata.
     if not re.search(r'\.(mp3|m4a|wav|ogg|aac)(\?|$)', url, re.IGNORECASE):
         print("  Fetching page...", file=sys.stderr)
-        html = downloader.fetch_text(url)
+        resolved_audio = None
+        try:
+            html = downloader.fetch_text(url)
+            resolved_audio, title = _extract_page_audio(html, url)
+        except ValueError:
+            raise
+        except RuntimeError:
+            # Re-validate URL before falling back to CDP so SSRF/private targets never reach Chromium.
+            downloader.public_url(url)
 
-        # Extract title
-        title_match = re.search(r'<title>(.*?)</title>', html, re.IGNORECASE | re.DOTALL)
-        if title_match:
-            title = title_match.group(1).strip()
-            title = re.sub(r'\s*[-|—].*$', '', title)  # remove site suffix
+        if not resolved_audio:
+            print("  Retrying episode page via desktop CDP...", file=sys.stderr)
+            try:
+                resolved_audio, cdp_title = _fetch_podcast_cdp(url)
+                if title == "Podcast Episode" and cdp_title:
+                    title = cdp_title
+            except Exception as exc:
+                raise RuntimeError(
+                    "Cannot extract audio URL from page. "
+                    "Try passing the direct audio link instead."
+                ) from exc
 
-        # Try og:audio meta tag (小宇宙、喜马拉雅等常用)
-        og_audio = re.search(
-            r'<meta\s+(?:property|name)=["\']og:audio["\']\s+content=["\'](.*?)["\']',
-            html, re.IGNORECASE
-        )
-        if og_audio:
-            audio_url = og_audio.group(1)
-        else:
-            # Try <audio> tag src
-            audio_tag = re.search(r'<audio[^>]+src=["\'](.*?)["\']', html, re.IGNORECASE)
-            if audio_tag:
-                audio_url = audio_tag.group(1)
-            else:
-                # Try JSON-LD or inline JSON with audioUrl / mediaSrc
-                json_audio = re.search(
-                    r'["\'](?:audioUrl|mediaSrc|enclosure|url)["\']\s*:\s*["\']'
-                    r'(https?://[^"\']+\.(?:mp3|m4a|wav|ogg|aac)[^"\']*)["\']',
-                    html, re.IGNORECASE
-                )
-                if json_audio:
-                    audio_url = json_audio.group(1)
-                else:
-                    # Try any .mp3/.m4a URL in the page
-                    any_audio = re.search(
-                        r'(https?://[^\s"\'<>]+\.(?:mp3|m4a|wav|ogg|aac)(?:\?[^\s"\'<>]*)?)',
-                        html, re.IGNORECASE
-                    )
-                    if any_audio:
-                        audio_url = any_audio.group(1)
-                    else:
-                        raise RuntimeError(
-                            "Cannot extract audio URL from page. "
-                            "Try passing the direct audio link instead."
-                        )
+        if not resolved_audio:
+            raise RuntimeError(
+                "Cannot extract audio URL from page. "
+                "Try passing the direct audio link instead."
+            )
 
+        audio_url = resolved_audio
         print("  Audio link resolved.", file=sys.stderr)
 
     # Generate filename

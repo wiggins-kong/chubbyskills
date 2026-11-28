@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""抖音 aweme detail 抓取：独立 profile 的无头 Chromium + CDP。
+"""抖音 aweme detail 抓取：独立临时 profile 的无头 Chromium + CDP。
 
 与正在运行的浏览器并存，不读 cookie、不关浏览器。用法：
     python douyin_cdp.py "<链接 / aweme_id / 整段分享文案>" [-o 输出目录]
@@ -12,9 +12,6 @@ import argparse
 import json
 import os
 import re
-import shutil
-import socket
-import subprocess
 import sys
 import tempfile
 import time
@@ -25,52 +22,10 @@ ROOT = SKILL_ROOT if os.path.isdir(os.path.join(SKILL_ROOT, "chubby_common")) el
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from chubby_common import deps
+from chubby_common import cdp
 
-UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-)
-
-BROWSERS = {
-    "win32": [
-        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
-        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
-        os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
-    ],
-    "darwin": [
-        "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
-        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-        "/Applications/Chromium.app/Contents/MacOS/Chromium",
-    ],
-}.get(sys.platform, [
-    "microsoft-edge",
-    "microsoft-edge-stable",
-    "google-chrome",
-    "google-chrome-stable",
-    "chromium",
-    "chromium-browser",
-])
-
-
-def browser_bin() -> str:
-    """定位本机 Chromium 系浏览器；BROWSER_BIN / EDGE_BIN 优先。"""
-    for name in ("BROWSER_BIN", "EDGE_BIN"):
-        env = os.environ.get(name, "").strip()
-        if not env:
-            continue
-        found = env if os.path.isabs(env) else shutil.which(env)
-        if not (found and os.path.exists(found)):
-            raise RuntimeError(f"{name} 指向的浏览器不存在：{env}")
-        return found
-    for candidate in BROWSERS:
-        found = candidate if os.path.isabs(candidate) else shutil.which(candidate)
-        if found and os.path.exists(found):
-            return found
-    raise RuntimeError(
-        "找不到 Edge/Chrome/Chromium（需要 109+）。用 BROWSER_BIN 指定可执行文件，"
-        "或运行 scripts/bootstrap.py 查看安装命令。"
-    )
+UA = cdp.UA
+browser_bin = cdp.browser_bin
 
 
 def _effective_url(url: str) -> str:
@@ -101,106 +56,40 @@ def aweme_id(text: str) -> str:
     return match.group(1)
 
 
-def _free_port() -> int:
-    sock = socket.socket()
-    sock.bind(("127.0.0.1", 0))
-    port = sock.getsockname()[1]
-    sock.close()
-    return port
-
-
-def _wait_target(port: int, timeout: int = 30) -> dict:
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            tabs = json.load(urllib.request.urlopen(f"http://127.0.0.1:{port}/json/list", timeout=3))
-            for tab in tabs:
-                if tab.get("type") == "page" and tab.get("webSocketDebuggerUrl"):
-                    return tab
-        except Exception:
-            pass
-        time.sleep(0.5)
-    raise RuntimeError("浏览器调试端口没起来：确认 Edge/Chrome/Chromium 是 109+ 且没有被安全策略拦住")
+def _extract_aweme_detail(entry: dict):
+    text = entry.get("body") or ""
+    if not text:
+        return None
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return None
+    return data if data.get("aweme_detail") else None
 
 
 def fetch_detail(video_id: str, attempts=(45, 30)) -> dict:
     """打开分享页，返回前端收回的 aweme detail 原始响应（含 aweme_detail）。"""
-    deps.check_python_module(
-        "websocket",
-        "python -m pip install websocket-client（或运行 scripts/bootstrap.py --install）",
-    )
-    import websocket
-
-    exe = browser_bin()
-    port = _free_port()
-    profile = tempfile.mkdtemp(prefix="dyprof-")
-    process = subprocess.Popen(
-        [exe, "--headless=new", "--disable-gpu", "--mute-audio", "--no-first-run",
-         f"--remote-debugging-port={port}", f"--user-data-dir={profile}", "about:blank"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    connection = None
-    try:
-        connection = websocket.create_connection(_wait_target(port)["webSocketDebuggerUrl"], timeout=20)
-        sequence = [0]
-
-        def call(method, params=None):
-            sequence[0] += 1
-            connection.settimeout(20)
-            connection.send(json.dumps({"id": sequence[0], "method": method, "params": params or {}}))
-            while True:
-                message = json.loads(connection.recv())
-                if message.get("id") == sequence[0]:
-                    return message
-
-        call("Network.enable")
-        call("Page.enable")
-
-        def capture(seconds):
-            deadline = time.time() + seconds
-            connection.settimeout(5)
-            while time.time() < deadline:
-                try:
-                    message = json.loads(connection.recv())
-                except websocket.WebSocketTimeoutException:
-                    continue
-                if message.get("method") != "Network.responseReceived":
-                    continue
+    share = f"https://www.iesdouyin.com/share/video/{video_id}/"
+    with cdp.CDPSession(site="douyin", ephemeral=True, headless=True) as session:
+        session.start(headless=True)
+        for index, seconds in enumerate(attempts):  # 抖音偶尔限流，第二次用同一 profile 重试
+            session._events.clear()
+            session.navigate(share)
+            captured = session.capture_xhr(
                 # shortcut: 依赖分享页前端继续请求 aweme/detail；抖音改接口时这里要跟着换
-                if "aweme/detail" not in message["params"]["response"]["url"]:
-                    continue
-                body = call("Network.getResponseBody", {"requestId": message["params"]["requestId"]})
-                text = body.get("result", {}).get("body", "")
-                if text:
-                    data = json.loads(text)
-                    if data.get("aweme_detail"):
-                        return data
-            return None
-
-        share = f"https://www.iesdouyin.com/share/video/{video_id}/"
-        for seconds in attempts:  # 抖音偶尔限流，第二次用同一 profile 重试
-            call("Page.navigate", {"url": share})
-            detail = capture(seconds)
-            if detail:
-                return detail
-            time.sleep(8)
-        raise RuntimeError(
-            "没抓到 aweme/detail 响应：先确认链接有效、网络能访问抖音，或隔几分钟再试。"
-            "环境检查用 scripts/bootstrap.py。"
-        )
-    finally:
-        if connection is not None:
-            try:
-                connection.close()
-            except Exception:
-                pass
-        process.terminate()
-        try:
-            process.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            process.kill()
-        shutil.rmtree(profile, ignore_errors=True)
+                "aweme/detail",
+                timeout=seconds,
+                predicate=lambda entry: _extract_aweme_detail(entry) is not None,
+                stop_on_match=True,
+            )
+            if captured:
+                return json.loads(captured[0]["body"])
+            if index + 1 < len(attempts):
+                time.sleep(8)
+    raise RuntimeError(
+        "没抓到 aweme/detail 响应：先确认链接有效、网络能访问抖音，或隔几分钟再试。"
+        "环境检查用 scripts/bootstrap.py。"
+    )
 
 
 def main(argv=None) -> int:

@@ -353,6 +353,11 @@ def infer_content_type(skill, source):
         return "audio"
     if skill == "douyin" and ("/note/" in lower or "/slides/" in lower):
         return "note"
+    if skill == "zhihu":
+        if "zhuanlan.zhihu.com" in lower or "/p/" in lower:
+            return "article"
+        if "/question/" in lower or "/answer/" in lower:
+            return "note"
     if skill in {"bilibili", "douyin", "tiktok", "weibo", "youtube", "zhihu"}:
         return "video"
     if skill == "wechat" or lower.endswith(".pdf"):

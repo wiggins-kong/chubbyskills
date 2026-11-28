@@ -22,11 +22,9 @@ from urllib.parse import parse_qsl, quote, unquote_plus, urlencode, urlparse, ur
 
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-try:
-    from tools import source_identity
-except ModuleNotFoundError:
+if sys.path[:1] != [ROOT]:
     sys.path.insert(0, ROOT)
-    from tools import source_identity
+from tools import source_identity
 
 # 静态映射作为兜底：正常情况下从 platforms/*.yaml 动态构建（见 load_skill_commands）
 STATIC_SKILL_COMMANDS = {
@@ -57,7 +55,10 @@ def load_skill_commands(platform_dir=None):
         platform_health = None
     if platform_health is not None:
         try:
-            directory = platform_dir or platform_health.DEFAULT_PLATFORM_DIR
+            local_platforms = os.path.join(ROOT, "platforms")
+            directory = platform_dir or (
+                local_platforms if os.path.isdir(local_platforms) else platform_health.DEFAULT_PLATFORM_DIR
+            )
             for platform in platform_health.load_records(directory):
                 pid = platform.get("id")
                 skill = platform.get("skill")
@@ -221,7 +222,12 @@ def run_command(cmd, dry_run=False):
     print("▶ " + " ".join(safe_command), file=sys.stderr)
     if dry_run:
         return ""
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    env = os.environ.copy()
+    existing_pp = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = f"{ROOT}{os.pathsep}{existing_pp}" if existing_pp else ROOT
+    env.setdefault("PYTHONIOENCODING", "utf-8")
+    env.setdefault("PYTHONUTF8", "1")
+    result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", env=env)
     if result.stderr:
         # Adapter paths are temporary. Only the published paths below are outputs.
         for line in result.stderr.splitlines():
@@ -282,6 +288,9 @@ def copy_into_vault(markdown_path, vault_dir):
 
 
 def main():
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser(description="Detect platform and run the matching chubbyskills workflow")
     parser.add_argument("source", help="URL, BV id, local audio file, or article PDF")
     parser.add_argument("--output", "-o", default="output", help="Working output directory")

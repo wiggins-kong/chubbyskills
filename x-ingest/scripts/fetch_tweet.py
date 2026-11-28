@@ -938,6 +938,136 @@ def load_fallback_data(args):
     )
 
 
+def _load_cdp():
+    skill_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    root = skill_root if os.path.isdir(os.path.join(skill_root, "chubby_common")) else os.path.dirname(skill_root)
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    from chubby_common import cdp
+    return cdp
+
+
+def _unwrap_tweet_result(result):
+    if isinstance(result, dict) and result.get("__typename") == "TweetWithVisibilityResults":
+        return result.get("tweet")
+    return result
+
+
+def _extract_graphql_result(body):
+    if not body:
+        return None
+    try:
+        payload = json.loads(body) if isinstance(body, str) else body
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    result = _unwrap_tweet_result(
+        ((payload.get("data") or {}).get("tweetResult") or {}).get("result")
+    )
+    if isinstance(result, dict) and (
+        result.get("legacy") or result.get("article") or result.get("note_tweet")
+    ):
+        return result
+    return None
+
+
+def _graphql_created_at(raw):
+    if not raw:
+        return ""
+    try:
+        return datetime.strptime(raw, "%a %b %d %H:%M:%S %z %Y").strftime("%Y-%m-%d")
+    except ValueError:
+        return str(raw)[:10]
+
+
+def _graphql_result_to_tweet(result, fallback_id=""):
+    """Convert GraphQL TweetResultByRestId result into syndication-shaped tweet dict."""
+    result = _unwrap_tweet_result(result)
+    if not isinstance(result, dict):
+        return None
+    if "legacy" not in result and (result.get("text") is not None or result.get("mediaDetails")):
+        return result
+    legacy = result.get("legacy") or {}
+    user_res = ((result.get("core") or {}).get("user_results") or {}).get("result") or {}
+    user_legacy = user_res.get("legacy") or {}
+    user_core = user_res.get("core") or {}
+    note_text = (
+        ((result.get("note_tweet") or {}).get("note_tweet_results") or {})
+        .get("result") or {}
+    ).get("text")
+    text = (note_text or legacy.get("full_text") or legacy.get("text") or "").strip()
+    media = (
+        (legacy.get("extended_entities") or {}).get("media")
+        or (legacy.get("entities") or {}).get("media")
+        or []
+    )
+    tw = {
+        "id_str": str(result.get("rest_id") or legacy.get("id_str") or fallback_id),
+        "text": text,
+        "created_at": _graphql_created_at(legacy.get("created_at") or ""),
+        "favorite_count": legacy.get("favorite_count", ""),
+        "conversation_count": legacy.get("reply_count", ""),
+        "user": {
+            "id_str": str(user_res.get("rest_id") or legacy.get("user_id_str") or ""),
+            "name": user_core.get("name") or user_legacy.get("name") or "",
+            "screen_name": user_core.get("screen_name") or user_legacy.get("screen_name") or "",
+        },
+        "mediaDetails": media,
+    }
+    article_res = ((result.get("article") or {}).get("article_results") or {}).get("result") or {}
+    if article_res:
+        tw["article"] = {
+            "title": article_res.get("title") or "",
+            "preview_text": article_res.get("preview_text") or "",
+            "rest_id": article_res.get("rest_id") or "",
+            "cover_media": article_res.get("cover_media") or {},
+        }
+    return tw
+
+
+def _apply_graphql_article(data, result):
+    title, text = extract_article_text(_unwrap_tweet_result(result))
+    if text:
+        data["text"] = text
+        data["article_is_preview"] = False
+        if title and not data.get("article_title"):
+            data["article_title"] = title
+        return True
+    return False
+
+
+def _cdp_cookie_header(cookies):
+    jar = {
+        c.get("name"): c.get("value")
+        for c in (cookies or [])
+        if isinstance(c, dict) and c.get("name") and c.get("value")
+    }
+    if jar.get("auth_token") and jar.get("ct0"):
+        return f"auth_token={jar['auth_token']}; ct0={jar['ct0']}"
+    return ""
+
+
+def _fetch_cdp_tweet_result(url, tweet_id):
+    cdp = _load_cdp()
+    state = cdp.fetch_page_state(
+        url,
+        site="x",
+        auth_cookies=("auth_token", "ct0"),
+        xhr_match="TweetResultByRestId",
+        xhr_predicate=lambda entry: _extract_graphql_result(entry.get("body")) is not None,
+        wait_seconds=15.0,
+        timeout=180,
+    )
+    cookies = _cdp_cookie_header((state or {}).get("cookies"))
+    result = None
+    for entry in (state or {}).get("xhr") or []:
+        result = _extract_graphql_result(entry.get("body"))
+        if result is not None:
+            break
+    return result, cookies
+
+
 def save_markdown(
     data, source_url, output_dir, title=None, image_refs=None, transcript=None
 ):
@@ -1002,11 +1132,16 @@ def main():
     source_url = (
         args.url if not args.url.isdigit() else f"https://x.com/i/status/{tweet_id}"
     )
+    cookies = args.cookies or os.environ.get("X_COOKIES")
+    has_fallback = bool(args.fallback_text or args.fallback_json)
     print(f"  🌐 抓取推文 {tweet_id}...", file=sys.stderr)
+    tw = None
+    fetch_err = None
+    cdp_result = None
     try:
         tw = fetch_tweet(tweet_id)
     except Exception as e:
-        if args.fallback_text or args.fallback_json:
+        if has_fallback:
             print(f"  ⚠️  请求失败，改用 fallback 数据：{e}", file=sys.stderr)
             data = load_fallback_data(args)
             output_path = save_markdown(
@@ -1015,18 +1150,10 @@ def main():
             print(f"✅ Saved fallback: {output_path}", file=sys.stderr)
             print(output_path)
             return
-        print(f"❌ 请求失败：{e}", file=sys.stderr)
-        print(
-            "   X syndication 端点可能临时不可用，或该推文受限/已删除。",
-            file=sys.stderr,
-        )
-        print(
-            "   可使用 --fallback-text 或 --fallback-json 继续生成标准 Markdown。",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-    if not tw or (tw.get("text") is None and not tw.get("mediaDetails")):
-        if args.fallback_text or args.fallback_json:
+        fetch_err = e
+
+    if fetch_err is not None or not tw or (tw.get("text") is None and not tw.get("mediaDetails")):
+        if has_fallback:
             print("  ⚠️  未取到推文内容，改用 fallback 数据", file=sys.stderr)
             data = load_fallback_data(args)
             output_path = save_markdown(
@@ -1035,7 +1162,27 @@ def main():
             print(f"✅ Saved fallback: {output_path}", file=sys.stderr)
             print(output_path)
             return
-        print("❌ 未取到推文内容（受限/已删除/端点变化）。", file=sys.stderr)
+        if not cookies:
+            print("  🔄 匿名接口不可用，尝试桌面浏览器 CDP 登录抓取...", file=sys.stderr)
+            try:
+                cdp_result, cdp_cookies = _fetch_cdp_tweet_result(source_url, tweet_id)
+                if cdp_result is None and cdp_cookies:
+                    cdp_result = fetch_article_graphql(tweet_id, cdp_cookies)
+                if cdp_result is not None:
+                    tw = _graphql_result_to_tweet(cdp_result, tweet_id)
+                    cookies = cdp_cookies or cookies
+            except Exception as cdp_err:
+                print(f"  ⚠️  CDP 抓取失败：{cdp_err}", file=sys.stderr)
+
+    if not tw or (tw.get("text") is None and not tw.get("mediaDetails")):
+        if fetch_err is not None:
+            print(f"❌ 请求失败：{fetch_err}", file=sys.stderr)
+            print(
+                "   X syndication 端点可能临时不可用，或该推文受限/已删除。",
+                file=sys.stderr,
+            )
+        else:
+            print("❌ 未取到推文内容（受限/已删除/端点变化）。", file=sys.stderr)
         print(
             "   可使用 --fallback-text 或 --fallback-json 继续生成标准 Markdown。",
             file=sys.stderr,
@@ -1045,6 +1192,8 @@ def main():
     data = parse_tweet(tw)
     if not data["tweet_id"]:
         data["tweet_id"] = tweet_id
+    if cdp_result is not None and data["note_type"] == "article":
+        _apply_graphql_article(data, cdp_result)
     thread_tweets = [tw]
     if args.thread:
         screen_name = (tw.get("user") or {}).get("screen_name")
@@ -1077,18 +1226,12 @@ def main():
             print(f"  ✅ 找到 {len(thread_tweets)} 条 thread 推文", file=sys.stderr)
 
     if data["note_type"] == "article" and data.get("article_is_preview"):
-        cookies = args.cookies or os.environ.get("X_COOKIES")
         if cookies:
             print("  📄 长文章，尝试登录态抓取全文...", file=sys.stderr)
             try:
                 result = fetch_article_graphql(tweet_id, cookies)
-                title, text = extract_article_text(result)
-                if text:
-                    data["text"] = text
-                    data["article_is_preview"] = False
-                    if title and not data["article_title"]:
-                        data["article_title"] = title
-                    print(f"  ✅ 抓到全文（{len(text)} 字）", file=sys.stderr)
+                if _apply_graphql_article(data, result):
+                    print(f"  ✅ 抓到全文（{len(data['text'])} 字）", file=sys.stderr)
                 else:
                     print(
                         "  ⚠️  登录态返回中未找到 Article 全文，保留预览",
@@ -1096,6 +1239,23 @@ def main():
                     )
             except Exception as e:
                 print(f"  ⚠️  登录态抓取失败：{e}，保留预览", file=sys.stderr)
+        elif not has_fallback:
+            print("  🔄 长文章预览，尝试桌面浏览器 CDP 登录抓取全文...", file=sys.stderr)
+            try:
+                art_result, cdp_cookies = _fetch_cdp_tweet_result(source_url, tweet_id)
+                applied = bool(art_result and _apply_graphql_article(data, art_result))
+                if not applied and cdp_cookies:
+                    gql_result = fetch_article_graphql(tweet_id, cdp_cookies)
+                    applied = bool(gql_result and _apply_graphql_article(data, gql_result))
+                if applied:
+                    print(f"  ✅ 抓到全文（{len(data['text'])} 字）", file=sys.stderr)
+                else:
+                    print(
+                        "  ⚠️  CDP 登录态返回中未找到 Article 全文，保留预览",
+                        file=sys.stderr,
+                    )
+            except Exception as e:
+                print(f"  ⚠️  CDP 登录态抓取失败：{e}，保留预览", file=sys.stderr)
         if data.get("article_is_preview"):
             print(
                 "  ⚠️  这是 X 长文章（Article），syndication 端点只返回开头预览，"

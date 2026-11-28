@@ -24,6 +24,7 @@ import argparse
 import subprocess
 import tempfile
 import shutil
+import urllib.error
 import urllib.request
 from datetime import datetime
 
@@ -343,6 +344,62 @@ def download_images(urls, out_dir, base, cookie):
     return refs
 
 
+def _load_cdp():
+    skill_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    root = skill_root if os.path.isdir(os.path.join(skill_root, "chubby_common")) else os.path.dirname(skill_root)
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    from chubby_common import cdp
+    return cdp
+
+
+def _xhs_gate(session) -> bool:
+    """Wait until Xiaohongshu session has web_session cookie and non-empty __INITIAL_STATE__."""
+    return bool(
+        session.eval_js(
+            "(() => { const s = window.__INITIAL_STATE__; "
+            "return Boolean(s && typeof s === 'object' && Object.keys(s).length > 0); })()",
+            await_promise=False,
+        )
+    )
+
+
+def _cookie_header(cookies) -> str:
+    if isinstance(cookies, str):
+        return cookies
+    return "; ".join(
+        f"{c['name']}={c.get('value', '')}"
+        for c in (cookies or [])
+        if isinstance(c, dict) and c.get("name")
+    )
+
+
+def _fetch_note_cdp(url: str):
+    cdp = _load_cdp()
+    state_resp = cdp.fetch_page_state(
+        url,
+        site="xiaohongshu",
+        auth_cookies=("web_session",),
+        gate=_xhs_gate,
+        js="(() => { try { return JSON.stringify(window.__INITIAL_STATE__ || null); } catch (e) { return null; } })()",
+        timeout=180,
+    )
+    raw_js = (state_resp or {}).get("js")
+    state = None
+    if isinstance(raw_js, dict):
+        state = raw_js
+    elif isinstance(raw_js, str) and raw_js and raw_js != "null":
+        try:
+            state = json.loads(raw_js)
+        except Exception:
+            state = None
+    html = (state_resp or {}).get("html") or ""
+    if not state and html:
+        state = extract_initial_state(html)
+    cdp_cookie = _cookie_header((state_resp or {}).get("cookies"))
+    return state, html, (state_resp or {}).get("url") or url, cdp_cookie
+
+
 def main():
     parser = argparse.ArgumentParser(description="小红书笔记采集")
     parser.add_argument("url", help="小红书笔记链接或 xhslink 短链")
@@ -368,6 +425,9 @@ def main():
         print("  ⚠️  未设置 XHS_COOKIE，未登录访问可能被风控拦截", file=sys.stderr)
 
     print(f"  🌐 抓取：{args.url}", file=sys.stderr)
+    html = ""
+    final_url = args.url
+    http_blocked_err = None
     try:
         html, final_url = http_get(args.url, cookie)
     except Exception as e:
@@ -378,22 +438,48 @@ def main():
             print(f"✅ Saved fallback: {output_path}", file=sys.stderr)
             print(output_path)
             return
-        print(f"❌ 请求失败：{e}", file=sys.stderr)
-        sys.exit(1)
+        if isinstance(e, urllib.error.HTTPError) and e.code in (403, 406):
+            http_blocked_err = e
+        else:
+            print(f"❌ 请求失败：{e}", file=sys.stderr)
+            sys.exit(1)
 
-    if "请通过小红书" in html or "verify" in final_url.lower():
-        if args.fallback_text:
-            print("  ⚠️  被风控拦截，改用 fallback 文本", file=sys.stderr)
-            data = build_fallback_data(read_fallback_text(args.fallback_text), args.fallback_title)
-            output_path = save_markdown(data, final_url, args.output, args.fallback_title)
-            print(f"✅ Saved fallback: {output_path}", file=sys.stderr)
-            print(output_path)
-            return
+    is_blocked = http_blocked_err is not None or "请通过小红书" in html or "verify" in final_url.lower()
+    if is_blocked and args.fallback_text:
+        print("  ⚠️  被风控拦截，改用 fallback 文本", file=sys.stderr)
+        data = build_fallback_data(read_fallback_text(args.fallback_text), args.fallback_title)
+        output_path = save_markdown(data, final_url, args.output, args.fallback_title)
+        print(f"✅ Saved fallback: {output_path}", file=sys.stderr)
+        print(output_path)
+        return
+
+    state = None if is_blocked else extract_initial_state(html)
+    if not args.fallback_text and (is_blocked or state is None):
+        print("  🔄 HTTP 被拦截或缺少 __INITIAL_STATE__，尝试桌面浏览器 CDP 登录兜底...", file=sys.stderr)
+        try:
+            cdp_state, cdp_html, cdp_url, cdp_cookie = _fetch_note_cdp(args.url)
+            if cdp_state:
+                state = cdp_state
+            if cdp_html:
+                html = cdp_html
+            if cdp_url:
+                final_url = cdp_url
+            if cdp_cookie:
+                cookie = cdp_cookie
+        except Exception as cdp_err:
+            print(f"  ⚠️  CDP 抓取失败：{cdp_err}", file=sys.stderr)
+            if http_blocked_err is not None:
+                print(f"❌ 请求失败：{http_blocked_err}", file=sys.stderr)
+                sys.exit(1)
+            if is_blocked:
+                print("❌ 被风控拦截。请设置 XHS_COOKIE 后重试，或手动复制正文交给 analyze_hook.py",
+                      file=sys.stderr)
+                sys.exit(1)
+
+    if is_blocked and state is None:
         print("❌ 被风控拦截。请设置 XHS_COOKIE 后重试，或手动复制正文交给 analyze_hook.py",
               file=sys.stderr)
         sys.exit(1)
-
-    state = extract_initial_state(html)
     data = None
     if state:
         note = find_note(state)

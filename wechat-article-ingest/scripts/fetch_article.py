@@ -119,6 +119,44 @@ def html_to_markdown(content_tag, source_url):
     return "\n\n".join(cleaned)
 
 
+def _load_cdp():
+    skill_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    root = skill_root if os.path.isdir(os.path.join(skill_root, "chubby_common")) else os.path.dirname(skill_root)
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    from chubby_common import cdp
+    return cdp
+
+
+def _wechat_gate(session) -> bool:
+    """Wait until WeChat article body exists and no captcha/block text is shown."""
+    return bool(
+        session.eval_js(
+            "(() => { const text = document.body ? document.body.innerText : ''; "
+            "if (text.includes('环境异常') || text.includes('请在微信客户端')) return false; "
+            "return document.querySelector('div.rich_media_content') !== null; })()",
+            await_promise=False,
+        )
+    )
+
+
+def _extract_wechat_article(html: str, url: str):
+    """Parse WeChat HTML into (title, author, content) or None if blocked/missing body."""
+    if not html or '环境异常' in html or '请在微信客户端' in html:
+        return None
+    from bs4 import BeautifulSoup
+    soup = BeautifulSoup(html, 'html.parser')
+    content_tag = soup.find('div', class_='rich_media_content')
+    if not content_tag:
+        return None
+    title_tag = soup.find('h1', class_='rich_media_title')
+    title = title_tag.get_text().strip() if title_tag else ""
+    author_tag = soup.find('span', class_='rich_media_meta_nickname')
+    author = author_tag.get_text().strip() if author_tag else ""
+    content = html_to_markdown(content_tag, url)
+    return title, author, content
+
+
 def fetch_from_url(url: str) -> tuple:
     """Fetch article from WeChat URL. Returns (title, author, content)."""
     print(f"  🌐 Fetching: {url[:60]}...", file=sys.stderr)
@@ -130,40 +168,42 @@ def fetch_from_url(url: str) -> tuple:
         capture_output=True, text=True, timeout=35
     )
 
-    if result.returncode != 0:
-        print("  ❌ Fetch failed", file=sys.stderr)
-        return None, None, None
-
-    html = result.stdout
-
-    # Check if blocked
-    if '环境异常' in html or '请在微信客户端' in html:
-        print("  ❌ Blocked by WeChat", file=sys.stderr)
-        return None, None, None
-
     try:
-        from bs4 import BeautifulSoup
-        soup = BeautifulSoup(html, 'html.parser')
+        from bs4 import BeautifulSoup  # noqa: F401
     except ImportError:
         print("  ❌ Need beautifulsoup4: pip install beautifulsoup4", file=sys.stderr)
         return None, None, None
 
-    # Extract title
-    title_tag = soup.find('h1', class_='rich_media_title')
-    title = title_tag.get_text().strip() if title_tag else ""
+    parsed = None
+    if result.returncode == 0:
+        parsed = _extract_wechat_article(result.stdout, url)
+        if parsed is None and ('环境异常' in result.stdout or '请在微信客户端' in result.stdout):
+            print("  ⚠️ Blocked by WeChat on HTTP, trying CDP fallback...", file=sys.stderr)
+        elif parsed is None:
+            print("  ⚠️ Missing rich_media_content on HTTP, trying CDP fallback...", file=sys.stderr)
+    else:
+        print("  ⚠️ Fetch failed on HTTP, trying CDP fallback...", file=sys.stderr)
 
-    # Extract author/account
-    author_tag = soup.find('span', class_='rich_media_meta_nickname')
-    author = author_tag.get_text().strip() if author_tag else ""
+    if parsed is None:
+        try:
+            cdp = _load_cdp()
+            state = cdp.fetch_page_state(
+                url,
+                site="wechat",
+                gate=_wechat_gate,
+                require_login=False,
+                timeout=180,
+            )
+            parsed = _extract_wechat_article((state or {}).get("html") or "", url)
+        except Exception as exc:
+            print(f"  ❌ CDP fallback failed: {exc}", file=sys.stderr)
+            return None, None, None
 
-    # Extract content
-    content_tag = soup.find('div', class_='rich_media_content')
-    if not content_tag:
+    if parsed is None:
         print("  ❌ No content found", file=sys.stderr)
         return None, None, None
 
-    content = html_to_markdown(content_tag, url)
-
+    title, author, content = parsed
     if len(content) < 100:
         print(f"  ❌ Content too short ({len(content)} chars)", file=sys.stderr)
         return None, None, None

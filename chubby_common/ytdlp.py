@@ -4,15 +4,157 @@
 """
 
 import os
+import re
 import subprocess
 import sys
 import time
+import urllib.parse
 
-from chubby_common import deps
+from chubby_common import cdp, deps
+
+PLATFORM_AUTH = {
+    "bilibili": ("bilibili", "https://passport.bilibili.com/login", ("SESSDATA",)),
+    "youtube": (
+        "youtube",
+        "https://accounts.google.com/ServiceLogin?service=youtube&continue=https://www.youtube.com/",
+        ("SID", "SAPISID", "__Secure-1PSID"),
+    ),
+    "weibo": ("weibo", "https://passport.weibo.com/sso/signin", ("SUB",)),
+    "tiktok": ("tiktok", "https://www.tiktok.com/login", ("sessionid", "sid_tt")),
+    "zhihu": ("zhihu", "https://www.zhihu.com/signin", ("z_c0",)),
+}
+
+_DOMAIN_TO_PLATFORM = {
+    "bilibili.com": "bilibili",
+    "b23.tv": "bilibili",
+    "youtube.com": "youtube",
+    "youtu.be": "youtube",
+    "weibo.com": "weibo",
+    "weibo.cn": "weibo",
+    "tiktok.com": "tiktok",
+    "zhihu.com": "zhihu",
+}
+
+_AUTH_ERROR_RE = re.compile(
+    r"(?:"
+    r"HTTP Error 40[13]|HTTP Error 412|\b403\b|\b412\b|\b401\b|"
+    r"forbidden|precondition failed|unauthorized|"
+    r"sign in|log\s*in|login required|not a bot|confirm your age|age[- ]?(?:limit|restricted|gate)|"
+    r"requires authentication|registered users|cookies-from-browser|--cookies|"
+    r"captcha|请登录|需要登录|风控|验证码"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def resolve_platform_auth(platform: str | None = None, url: str | None = None):
+    """按平台 ID 或 URL 解析 (site, login_url, auth_cookie_names)。"""
+    if platform:
+        spec = PLATFORM_AUTH.get(platform.strip().lower())
+        if spec is not None:
+            return spec
+    if url:
+        host = (urllib.parse.urlsplit(url).hostname or "").lower()
+        for domain, plat in _DOMAIN_TO_PLATFORM.items():
+            if host == domain or host.endswith("." + domain):
+                return PLATFORM_AUTH[plat]
+    return None
+
+
+def has_auth_profile(platform: str | None = None, url: str | None = None) -> bool:
+    """判断对应平台是否已有落盘的 CDP 登录态 profile。"""
+    spec = resolve_platform_auth(platform, url)
+    return bool(spec and cdp.has_profile_session(spec[0]))
+
+
+def has_explicit_cookies(cfg=None, args=()) -> bool:
+    """判断用户是否已通过环境变量或参数显式指定了 cookie。"""
+    if os.environ.get("YTDLP_COOKIES_FROM_BROWSER", "").strip():
+        return True
+    extra = getattr(cfg, "extra_ydl_args", ()) if cfg is not None else ()
+    for arg in (*extra, *args):
+        s = str(arg)
+        if s in ("--cookies", "--cookies-from-browser") or s.startswith(
+            ("--cookies=", "--cookies-from-browser=")
+        ):
+            return True
+    return False
+
+
+def ensure_platform_cookies_txt(platform: str | None = None, url: str | None = None) -> str | None:
+    """通过持久化 CDP profile 确保平台已登录，并导出临时 Netscape cookies.txt。
+
+    调用方负责在 finally 中删除返回的临时文件；CDP 不可用或登录失败时返回 None。
+    """
+    spec = resolve_platform_auth(platform, url)
+    if spec is None:
+        return None
+    site, login_url, auth_cookies = spec
+    if len(auth_cookies) == 1:
+        gate_kwargs = {"auth_cookies": auth_cookies}
+    else:
+        # 多候选 cookie 名满足任一即视为已登录，避免 cdp.ensure_session(auth_cookies=...) 要求全量存在
+        gate_kwargs = {
+            "gate": lambda sess: any(
+                c.get("name") in auth_cookies and c.get("value") for c in sess.cookies()
+            )
+        }
+    try:
+        with cdp.ensure_session(
+            url or login_url,
+            site=site,
+            login_url=login_url,
+            **gate_kwargs,
+        ) as session:
+            return cdp.export_cookies_txt(session)
+    except (Exception, SystemExit) as exc:
+        print(f"  ⚠️  CDP cookie 获取失败，跳过 cookie 回退：{exc}", file=sys.stderr)
+        return None
+
+
+def _extract_url(args) -> str | None:
+    for arg in args:
+        s = str(arg)
+        if urllib.parse.urlsplit(s).scheme in ("http", "https"):
+            return s
+    return None
+
+
+def _is_auth_error(exc: subprocess.CalledProcessError) -> bool:
+    text = f"{exc.stderr or ''}\n{exc.stdout or ''}"
+    return bool(text.strip() and _AUTH_ERROR_RE.search(text))
+
+
+def _remove_file(path: str | None) -> None:
+    if not path:
+        return
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def _build_ydl_cmd(cfg, args, cookies_file: str | None = None) -> list[str]:
+    cmd = ["yt-dlp", "--no-check-certificates", "--user-agent", cfg.ua]
+    browser = os.environ.get("YTDLP_COOKIES_FROM_BROWSER", "").strip()
+    if browser:
+        cmd += ["--cookies-from-browser", browser]
+    if cookies_file:
+        cmd += ["--cookies", cookies_file]
+    components = os.environ.get("YTDLP_REMOTE_COMPONENTS", "").strip()
+    if components:
+        cmd += ["--remote-components", components]
+    if cfg.referer:
+        cmd += ["--referer", cfg.referer]
+    cmd += list(cfg.extra_ydl_args) + list(args)
+    return cmd
 
 
 def run_ydl(cfg, args, timeout, capture=True):
     """统一的 yt-dlp 调用，自动带上平台的 UA / Referer / 额外参数。
+
+    遇到登录/403/412/年龄或机器人拦截且未显式指定 cookie 时，自动通过
+    chubby_common.cdp 导出临时 cookies.txt 并重试一次。
 
     环境变量：
     - YTDLP_COOKIES_FROM_BROWSER：如 chrome / safari，传递给 --cookies-from-browser，
@@ -20,19 +162,26 @@ def run_ydl(cfg, args, timeout, capture=True):
     - YTDLP_REMOTE_COMPONENTS：如 ejs:github，YouTube JS challenge 求解组件。
     """
     deps.ensure_ytdlp()
-    cmd = ["yt-dlp", "--no-check-certificates", "--user-agent", cfg.ua]
-    browser = os.environ.get("YTDLP_COOKIES_FROM_BROWSER", "").strip()
-    if browser:
-        cmd += ["--cookies-from-browser", browser]
-    components = os.environ.get("YTDLP_REMOTE_COMPONENTS", "").strip()
-    if components:
-        cmd += ["--remote-components", components]
-    if cfg.referer:
-        cmd += ["--referer", cfg.referer]
-    cmd += list(cfg.extra_ydl_args) + list(args)
-    return subprocess.run(
-        cmd, capture_output=capture, text=True, timeout=timeout, check=True
-    )
+    cmd = _build_ydl_cmd(cfg, args)
+    try:
+        return subprocess.run(
+            cmd, capture_output=capture, text=True, timeout=timeout, check=True
+        )
+    except subprocess.CalledProcessError as exc:
+        if has_explicit_cookies(cfg, args) or not _is_auth_error(exc):
+            raise
+        cookies_file = ensure_platform_cookies_txt(
+            getattr(cfg, "id", None), _extract_url(args)
+        )
+        if not cookies_file:
+            raise
+        try:
+            retry_cmd = _build_ydl_cmd(cfg, args, cookies_file=cookies_file)
+            return subprocess.run(
+                retry_cmd, capture_output=capture, text=True, timeout=timeout, check=True
+            )
+        finally:
+            _remove_file(cookies_file)
 
 
 def get_title(cfg, url: str) -> str:
